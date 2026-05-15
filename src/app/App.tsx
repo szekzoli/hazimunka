@@ -3,8 +3,9 @@ import { ChoreEntry } from "./components/ChoreEntry";
 import { DailyEntries } from "./components/DailyEntries";
 import { WeeklyChecklist } from "./components/WeeklyChecklist";
 import { Summary } from "./components/Summary";
-import { Home, CheckSquare, BarChart3, ListPlus } from "lucide-react";
+import { Home, CheckSquare, BarChart3, ListPlus, RefreshCw } from "lucide-react";
 import { Toaster, toast } from "sonner";
+import { supabase } from "../lib/supabase";
 
 interface ChoreEntryData {
   id: string;
@@ -50,58 +51,114 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<"add" | "daily" | "checklist" | "summary">("add");
   const [entries, setEntries] = useState<ChoreEntryData[]>([]);
   const [availableTasks, setAvailableTasks] = useState<string[]>(INITIAL_TASKS);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem("choreEntries");
-      if (saved) {
-        setEntries(JSON.parse(saved));
-      }
+    loadData();
 
-      const savedTasks = localStorage.getItem("availableTasks");
-      if (savedTasks) {
-        setAvailableTasks(JSON.parse(savedTasks));
-      }
-    } catch (error) {
-      console.error("Error loading from localStorage:", error);
-    }
+    const channel = supabase
+      .channel("chore-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "chore_entries" }, () => {
+        loadEntries();
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "available_tasks" }, () => {
+        loadTasks();
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, []);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem("choreEntries", JSON.stringify(entries));
-      console.log("Saved entries:", entries.length);
-    } catch (error) {
-      console.error("Error saving entries to localStorage:", error);
-    }
-  }, [entries]);
+  const loadEntries = async () => {
+    const { data, error } = await supabase
+      .from("chore_entries")
+      .select("*")
+      .order("date", { ascending: false });
 
-  useEffect(() => {
-    try {
-      localStorage.setItem("availableTasks", JSON.stringify(availableTasks));
-    } catch (error) {
-      console.error("Error saving tasks to localStorage:", error);
+    if (error) {
+      console.error("Error loading entries:", error);
+      return;
     }
-  }, [availableTasks]);
+    if (data) {
+      setEntries(
+        data.map((e) => ({
+          id: e.id,
+          person: e.person,
+          task: e.task,
+          timeMinutes: e.time_minutes,
+          notes: e.notes ?? "",
+          date: e.date,
+        }))
+      );
+    }
+  };
 
-  const handleAddEntry = (entry: Omit<ChoreEntryData, "id">) => {
-    const newEntry = {
-      ...entry,
-      id: Date.now().toString(),
-    };
-    setEntries([...entries, newEntry]);
-    toast.success("Sikeres hozzáadás!", {
-      duration: 2000,
+  const loadTasks = async () => {
+    const { data, error } = await supabase
+      .from("available_tasks")
+      .select("name")
+      .order("name");
+
+    if (error) {
+      console.error("Error loading tasks:", error);
+      return;
+    }
+    if (data && data.length > 0) {
+      setAvailableTasks(data.map((t) => t.name));
+    }
+  };
+
+  const loadData = async () => {
+    setLoading(true);
+
+    const { data: tasksData } = await supabase
+      .from("available_tasks")
+      .select("name")
+      .order("name");
+
+    if (!tasksData || tasksData.length === 0) {
+      await supabase
+        .from("available_tasks")
+        .upsert(INITIAL_TASKS.map((name) => ({ name })), { onConflict: "name" });
+      setAvailableTasks([...INITIAL_TASKS].sort());
+    } else {
+      setAvailableTasks(tasksData.map((t) => t.name));
+    }
+
+    await loadEntries();
+    setLoading(false);
+  };
+
+  const handleAddEntry = async (entry: Omit<ChoreEntryData, "id">) => {
+    const { error } = await supabase.from("chore_entries").insert({
+      person: entry.person,
+      task: entry.task,
+      time_minutes: entry.timeMinutes,
+      notes: entry.notes,
+      date: entry.date,
     });
+
+    if (error) {
+      toast.error("Hiba a mentés közben!");
+    } else {
+      toast.success("Sikeres hozzáadás!", { duration: 2000 });
+    }
   };
 
-  const handleDeleteEntry = (id: string) => {
-    setEntries(entries.filter((e) => e.id !== id));
+  const handleDeleteEntry = async (id: string) => {
+    const { error } = await supabase.from("chore_entries").delete().eq("id", id);
+    if (error) {
+      toast.error("Hiba a törlés közben!");
+    }
   };
 
-  const handleAddNewTask = (task: string) => {
+  const handleAddNewTask = async (task: string) => {
     if (!availableTasks.includes(task)) {
-      setAvailableTasks([...availableTasks, task].sort());
+      await supabase
+        .from("available_tasks")
+        .upsert({ name: task }, { onConflict: "name" });
     }
   };
 
@@ -120,22 +177,29 @@ export default function App() {
           <h1 className="text-xl font-bold text-gray-800">Házimunka Követő</h1>
         </div>
 
-        <div className="space-y-4">
-          {activeTab === "add" && (
-            <ChoreEntry
-              onAddEntry={handleAddEntry}
-              availableTasks={availableTasks}
-              onAddNewTask={handleAddNewTask}
-            />
-          )}
-          {activeTab === "daily" && (
-            <DailyEntries entries={entries} onDeleteEntry={handleDeleteEntry} />
-          )}
-          {activeTab === "checklist" && (
-            <WeeklyChecklist entries={entries} recurringTasks={RECURRING_TASKS} />
-          )}
-          {activeTab === "summary" && <Summary entries={entries} />}
-        </div>
+        {loading ? (
+          <div className="flex flex-col items-center justify-center py-16 gap-3">
+            <RefreshCw className="w-8 h-8 text-blue-500 animate-spin" />
+            <p className="text-gray-500">Adatok betöltése...</p>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {activeTab === "add" && (
+              <ChoreEntry
+                onAddEntry={handleAddEntry}
+                availableTasks={availableTasks}
+                onAddNewTask={handleAddNewTask}
+              />
+            )}
+            {activeTab === "daily" && (
+              <DailyEntries entries={entries} onDeleteEntry={handleDeleteEntry} />
+            )}
+            {activeTab === "checklist" && (
+              <WeeklyChecklist entries={entries} recurringTasks={RECURRING_TASKS} />
+            )}
+            {activeTab === "summary" && <Summary entries={entries} />}
+          </div>
+        )}
       </div>
 
       <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg">
